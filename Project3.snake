@@ -1,0 +1,263 @@
+CONDITIONS = ['IP','CTL']
+REPS = ['rep1','rep2']
+
+rule all:
+    input:
+        'results/mouse_chipseq_index.done',
+        'results/multiqc_report.html',
+        expand('results/{condition}_{rep}.flagstat.txt', condition=CONDITIONS, rep=REPS),
+        'results/correlation_heatmap.png',
+        'results/fingerprint.png',
+        'results/annotated_peaks.txt',
+        motifs = 'results/motifs/'
+
+rule wget_m39:
+    output:
+        'results/GRCm39.primary_assembly.genome.fa.gz'
+    params:
+        ftp_path = 'https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M34/GRCm39.primary_assembly.genome.fa.gz'
+    shell:
+        'wget -p {params.ftp_path} -O {output}'
+
+rule wget_m39_gtf:
+    output:
+        'results/gencode.vM34.primary_assembly.annotation.gtf.gz'
+    params:
+        ftp_path = 'https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M34/gencode.vM34.primary_assembly.annotation.gtf.gz'
+    shell:
+        'wget -p {params.ftp_path} -O {output}'
+
+rule bowtie2_build_gencode:
+    input:
+            reference = 'results/GRCm39.primary_assembly.genome.fa.gz'
+    output:
+            touch('results/mouse_chipseq_index.done')
+    params:
+            base = 'results/mouse_chipseq_index'
+    threads: 16
+    conda:
+        'envs/bowtie2_env.yml'
+    shell:
+        'bowtie2-build {input.reference} {params.base} --threads {threads}'
+
+rule fastqc:
+    input:
+            fastq = 'samples/{condition}_{rep}.fastq.gz'
+    output:
+            fastqc = 'results/{condition}_{rep}_fastqc.html'
+    params:
+            outdir = 'results/'
+    threads: 4
+    conda:
+        'envs/fastqc_env.yml'
+    shell:
+        'fastqc -t {threads} {input.fastq} --outdir {params.outdir}'
+
+rule trimmomatic:
+    input:
+            fastq = 'samples/{condition}_{rep}.fastq.gz',
+            fastqc = 'results/{condition}_{rep}_fastqc.html',
+            adapter = 'samples/TruSeq2-SE.fa'
+    output:
+            trim = 'results/{condition}_{rep}_trimmed.fastq.gz'
+    threads: 8
+    conda:
+        'envs/trimmomatic_env.yml'
+    shell:
+        'trimmomatic SE -threads {threads} {input.fastq} {output.trim} ILLUMINACLIP:{input.adapter}:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15'
+
+rule bowtie2_align:
+    input: 
+        reads = 'results/{condition}_{rep}_trimmed.fastq.gz',
+        index = 'results/mouse_chipseq_index.done'
+    output: 
+        bam = 'results/{condition}_{rep}.bam'
+    threads: 
+        16
+    params:
+        index = 'results/mouse_chipseq_index'
+    conda:
+        'envs/bowtie2_env.yml'
+    shell:
+        'bowtie2 -p 14 -x {params.index} -U {input.reads} | samtools view -bS - -o {output.bam}'
+
+rule samtools_sort:
+    input:
+        bam = 'results/{condition}_{rep}.bam'
+    output:
+        sorted = 'results/{condition}_{rep}.sorted.bam'
+    conda:
+        'envs/samtools_env.yml'
+    shell:
+        'samtools sort {input.bam} -o {output.sorted}'
+
+rule samtools_idx:
+    input:
+        sorted = 'results/{condition}_{rep}.sorted.bam'
+    output:
+        indexed = 'results/{condition}_{rep}.sorted.bam.bai'
+    conda:
+        'envs/samtools_env.yml'
+    shell:
+        'samtools index {input.sorted}'
+
+rule samtools_flagstats:
+    input:
+        sorted = 'results/{condition}_{rep}.sorted.bam',
+        indexed = 'results/{condition}_{rep}.sorted.bam.bai'
+    output:
+        flagstats = 'results/{condition}_{rep}.flagstat.txt'
+    conda:
+        'envs/samtools_env.yml'
+    shell:
+        'samtools flagstats {input.sorted} > {output.flagstats}'
+
+rule multiqc:
+    input:
+        expand('results/{condition}_{rep}_fastqc.html', condition=CONDITIONS, rep=REPS)
+    output:
+        results = 'results/multiqc_report.html'
+    params:
+        outdir = 'results/'
+    conda:
+        'envs/multiqc_env.yml'
+    shell:
+        'multiqc {params.outdir} -o {params.outdir}'
+
+rule plotFingerprint:
+    input:
+        bams = expand('results/{condition}_{rep}.sorted.bam', condition=CONDITIONS, rep=REPS),
+        bais = expand('results/{condition}_{rep}.sorted.bam.bai', condition=CONDITIONS, rep=REPS)
+    output:
+        'results/fingerprint.png'
+    conda:
+        'envs/deeptools_env.yml'
+    shell:
+        'plotFingerprint -b {input.bams} -plot {output}'
+
+rule bamCoverage:
+    input:
+        bam = 'results/{condition}_{rep}.sorted.bam',
+        bai = 'results/{condition}_{rep}.sorted.bam.bai'
+    output:
+        'results/{condition}_{rep}.bw'
+    threads: 4
+    conda:
+        'envs/deeptools_env.yml'
+    shell:
+        'bamCoverage -b {input.bam} -o {output} -p {threads}'
+
+rule multiBwSummary:
+    input:
+        bws = expand('results/{condition}_{rep}.bw', condition=CONDITIONS, rep=REPS)
+    output:
+        'results/bw_summary_results.npz'
+    conda:
+        'envs/deeptools_env.yml'
+    shell:
+        'multiBigwigSummary bins -b {input.bws} -o {output}'
+
+rule plotCorrelation:
+    input:
+        'results/bw_summary_results.npz'
+    output:
+        'results/correlation_heatmap.png'
+    params:
+    conda:
+        'envs/deeptools_env.yml'
+    shell:
+        'plotCorrelation -in {input} -c pearson -p heatmap -o {output}'
+
+rule make_tag_dir:
+    input: 
+        bam = 'results/{condition}_{rep}.sorted.bam'
+    output:
+        directory('tagDir_{condition}_{rep}/')
+    params: 
+        outdir = 'tagDir_{condition}_{rep}/'
+    conda:
+        'envs/homer_env.yml'
+    shell:
+        'makeTagDirectory {params.outdir} {input.bam}'
+
+rule findPeaks:
+    input:
+        tag_dir = 'tagDir_IP_{rep}/',
+        control_tag_dir = 'tagDir_CTL_{rep}/'
+    output:
+        'results/peaks_{rep}.txt'
+    conda:
+        'envs/homer_env.yml'
+    shell:
+        'findPeaks {input.tag_dir} -style factor -o {output} -i {input.control_tag_dir}'
+
+rule convertPeakFiles:
+    input: 
+        'results/peaks_{rep}.txt'
+    output:
+        'results/peaks_{rep}.bed'
+    conda:
+        'envs/homer_env.yml'
+    shell:
+        'pos2bed.pl {input} > {output}'
+
+rule intersect_peaks:
+    input:
+        peaks1 = 'results/peaks_rep1.bed',
+        peaks2 = 'results/peaks_rep2.bed'
+    output:
+        unique_peaks = 'results/unique_peaks.bed'
+    conda:
+        'envs/bedtools_env.yml'
+    shell:
+        'bedtools intersect -a {input.peaks1} -b {input.peaks2} -f 0.5 -v > {output.unique_peaks}'
+
+rule filter_blacklist:
+    input:
+        peaks = 'results/unique_peaks.bed',
+        blacklist = 'samples/mm10-blacklist.v2.bed'
+    output:
+        filtered_peaks = 'results/filtered_peaks.bed'
+    conda:
+        'envs/bedtools_env.yml'
+    shell:
+        'bedtools intersect -v -a {input.peaks} -b {input.blacklist} > {output}'
+
+rule unzip_gtf:
+    input:
+        gz = 'results/gencode.vM34.primary_assembly.annotation.gtf.gz'
+    output:
+        gtf = 'results/gencode.vM34.primary_assembly.annotation.gtf'
+    shell:
+        'gunzip -c {input.gz} > {output.gtf}'
+
+rule annotate_peaks:
+    input:
+        bed = 'results/filtered_peaks.bed',
+        gtf = 'results/gencode.vM34.primary_assembly.annotation.gtf',
+        genome = 'results/GRCm39.primary_assembly.genome.fa'
+    output:
+        'results/annotated_peaks.txt'
+    conda:
+        'envs/homer_env.yml'
+    shell:
+        'annotatePeaks.pl {input.bed} {input.genome} -gtf {input.gtf} > {output}'
+
+rule unzip_genome:
+    input:
+        genome = 'results/GRCm39.primary_assembly.genome.fa.gz'
+    output:
+        'results/GRCm39.primary_assembly.genome.fa'
+    shell:
+        'gunzip -c {input.genome} > {output}'
+
+rule motifs:
+    input:
+        bed = 'results/filtered_peaks.bed',
+        genome = 'results/GRCm39.primary_assembly.genome.fa'
+    output:
+        motifs = directory('results/motifs/')
+    conda:
+        'envs/homer_env.yml'
+    shell:
+        'findMotifsGenome.pl {input.bed} {input.genome} {output.motifs} -size 200 -mask'
